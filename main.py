@@ -5,13 +5,16 @@ import base64
 from PIL import Image
 import io
 import re
-from anthropic import Anthropic, APIStatusError, APIError
 import difflib
 import time
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.markdown import Markdown
+
+import requests
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 
 console = Console()
 
@@ -20,11 +23,16 @@ CONTINUATION_EXIT_PHRASE = "AUTOMODE_COMPLETE"
 MAX_CONTINUATION_ITERATIONS = 25
 
 # Models to use
-MAINMODEL = "claude-3-5-sonnet-20240620"
-TOOLCHECKERMODEL = "claude-3-5-sonnet-20240620"
+MAINMODEL = "claude-3-5-sonnet@20240620"
+TOOLCHECKERMODEL = "claude-3-5-sonnet@20240620"
 
-# Initialize the Anthropic client
-client = Anthropic(api_key="YOUR KEY")
+# 配置信息
+PROJECT_ID = 'angelic-center-429005-t3'
+CLIENT_ID = '764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com'
+CLIENT_SECRET = 'd-FL95Q19q7MQmFpd7hHD0Ty'
+REFRESH_TOKEN = '1//06NsH2-gUPK73CgYIARAAGAYSNwF-L9IrL-OdT_ziOr6W-zlmKqpjyuLUJjK1FObT62OyRkJn-bhloub5TKxcH9C1zRKKNw2kZy4'
+
+TOKEN_URL = 'https://www.googleapis.com/oauth2/v4/token'
 
 # Initialize the Tavily client
 tavily = TavilyClient(api_key="YOUR KEY")
@@ -34,6 +42,27 @@ conversation_history = []
 
 # automode flag
 automode = False
+
+
+# base prompt and automode_system_prompt remain unchanged
+
+def get_access_token():
+    creds = Credentials(
+        token=None,
+        refresh_token=REFRESH_TOKEN,
+        token_uri=TOKEN_URL,
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET
+    )
+
+    creds.refresh(Request())
+    return creds.token
+
+
+def get_api_url(model):
+    location = 'us-east5'  # 或者使用您需要的其他位置
+    return f"https://{location}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{location}/publishers/anthropic/models/{model}:streamRawPredict"
+
 
 # base prompt
 base_system_prompt = """
@@ -120,6 +149,7 @@ You are currently in automode. Follow these guidelines:
 Remember: Focus on completing the established goals efficiently and effectively. Avoid unnecessary conversations or requests for additional tasks.
 """
 
+
 def update_system_prompt(current_iteration=None, max_iterations=None):
     global base_system_prompt, automode_system_prompt
     chain_of_thought_prompt = """
@@ -135,12 +165,14 @@ def update_system_prompt(current_iteration=None, max_iterations=None):
     else:
         return base_system_prompt + "\n\n" + chain_of_thought_prompt
 
+
 def create_folder(path):
     try:
         os.makedirs(path, exist_ok=True)
         return f"Folder created: {path}"
     except Exception as e:
         return f"Error creating folder: {str(e)}"
+
 
 def create_file(path, content=""):
     try:
@@ -150,8 +182,10 @@ def create_file(path, content=""):
     except Exception as e:
         return f"Error creating file: {str(e)}"
 
+
 def highlight_diff(diff_text):
     return Syntax(diff_text, "diff", theme="monokai", line_numbers=True)
+
 
 def generate_and_apply_diff(original_content, new_content, path):
     diff = list(difflib.unified_diff(
@@ -181,10 +215,12 @@ def generate_and_apply_diff(original_content, new_content, path):
 
         console.print(diff_panel)
 
-        added_lines = sum(1 for line in diff if line.startswith('+') and not line.startswith('+++'))
-        removed_lines = sum(1 for line in diff if line.startswith('-') and not line.startswith('---'))
+        added_lines = sum(1 for line in diff if line.startswith(
+            '+') and not line.startswith('+++'))
+        removed_lines = sum(1 for line in diff if line.startswith(
+            '-') and not line.startswith('---'))
 
-        summary = f"Changes applied to {path}:\n"
+        summary = f"Changes applied to {path}: \n"
         summary += f"  Lines added: {added_lines}\n"
         summary += f"  Lines removed: {removed_lines}\n"
 
@@ -200,20 +236,21 @@ def generate_and_apply_diff(original_content, new_content, path):
         return f"Error applying changes: {str(e)}"
 
 
-
 # Update the edit_file function
 def edit_and_apply(path, new_content):
     try:
         with open(path, 'r') as file:
             original_content = file.read()
-        
+
         if new_content != original_content:
-            diff_result = generate_and_apply_diff(original_content, new_content, path)
-            return f"Changes applied to {path}:\n{diff_result}"
+            diff_result = generate_and_apply_diff(
+                original_content, new_content, path)
+            return f"Changes applied to {path}: \n{diff_result}"
         else:
             return f"No changes needed for {path}"
     except Exception as e:
         return f"Error editing/applying to file: {str(e)}"
+
 
 def read_file(path):
     try:
@@ -223,6 +260,7 @@ def read_file(path):
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
+
 def list_files(path="."):
     try:
         files = os.listdir(path)
@@ -230,12 +268,14 @@ def list_files(path="."):
     except Exception as e:
         return f"Error listing files: {str(e)}"
 
+
 def tavily_search(query):
     try:
         response = tavily.qna_search(query=query, search_depth="advanced")
         return response
     except Exception as e:
         return f"Error performing search: {str(e)}"
+
 
 tools = [
     {
@@ -289,23 +329,23 @@ tools = [
         }
     },
     {
-    "name": "edit_and_apply",
-    "description": "Apply changes to a file. Use this when you need to edit a file.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "The path of the file to edit"
+        "name": "edit_and_apply",
+        "description": "Apply changes to a file. Use this when you need to edit a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path of the file to edit"
+                },
+                "new_content": {
+                    "type": "string",
+                    "description": "The new content to apply to the file"
+                }
             },
-            "new_content": {
-                "type": "string",
-                "description": "The new content to apply to the file"
-            }
-        },
-        "required": ["path", "new_content"]
-    }
-},
+            "required": ["path", "new_content"]
+        }
+    },
     {
         "name": "read_file",
         "description": "Read the contents of a file at the specified path. Use this when you need to examine the contents of an existing file.",
@@ -350,6 +390,8 @@ tools = [
 ]
 
 # Update the execute_tool function
+
+
 def execute_tool(tool_name, tool_input):
     try:
         if tool_name == "create_folder":
@@ -371,6 +413,7 @@ def execute_tool(tool_name, tool_input):
     except Exception as e:
         return f"Error executing tool {tool_name}: {str(e)}"
 
+
 def encode_image_to_base64(image_path):
     try:
         with Image.open(image_path) as img:
@@ -384,9 +427,11 @@ def encode_image_to_base64(image_path):
     except Exception as e:
         return f"Error encoding image: {str(e)}"
 
+
 def parse_goals(response):
     goals = re.findall(r'Goal \d+: (.+)', response)
     return goals
+
 
 def execute_goals(goals):
     global automode
@@ -395,8 +440,10 @@ def execute_goals(goals):
         response, _ = chat_with_claude(f"Continue working on goal: {goal}")
         if CONTINUATION_EXIT_PHRASE in response:
             automode = False
-            console.print(Panel("Exiting automode.", title="Automode", style="bold green"))
+            console.print(Panel("Exiting automode.",
+                                title="Automode", style="bold green"))
             break
+
 
 def chat_with_claude(user_input, image_path=None, current_iteration=None, max_iterations=None):
     global conversation_history, automode
@@ -429,62 +476,77 @@ def chat_with_claude(user_input, image_path=None, current_iteration=None, max_it
             ]
         }
         current_conversation.append(image_message)
-        console.print(Panel("Image message added to conversation history", title_align="left", title="Image Added", style="green"))
+        console.print(Panel("Image message added to conversation history",title_align="left", title="Image Added", style="green"))
     else:
         current_conversation.append({"role": "user", "content": user_input})
 
     messages = conversation_history + current_conversation
 
+    # 获取访问令牌
+    access_token = get_access_token()
+
+    # 构建 API URL
+    api_url = get_api_url(MAINMODEL)
+
+    # 准备请求体
+    request_body = {
+        "anthropic_version": "vertex-2023-10-16",
+        "messages": messages,
+        "max_tokens": 4000,
+        "tools": tools,
+        "tool_choice": {"type": "auto"},
+        "system": update_system_prompt(current_iteration, max_iterations)
+    }
+
+    # 发送请求
     try:
-        response = client.messages.create(
-            model=MAINMODEL,
-            max_tokens=4000,
-            system=update_system_prompt(current_iteration, max_iterations),
-            messages=messages,
-            tools=tools,
-            tool_choice={"type": "auto"}
-        )
-    except APIStatusError as e:
-        if e.status_code == 429:
-            console.print(Panel("Rate limit exceeded. Retrying after a short delay...", title="API Error", style="bold yellow"))
-            time.sleep(5)
-            return chat_with_claude(user_input, image_path, current_iteration, max_iterations)
-        else:
-            console.print(Panel(f"API Error: {str(e)}", title="API Error", style="bold red"))
-            return "I'm sorry, there was an error communicating with the AI. Please try again.", False
-    except APIError as e:
-        console.print(Panel(f"API Error: {str(e)}", title="API Error", style="bold red"))
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+        response = requests.post(api_url, json=request_body, headers=headers)
+        response.raise_for_status()
+        response_data = response.json()
+    except requests.exceptions.RequestException as e:
+        console.print(
+            Panel(f"API Error: {str(e)}", title="API Error", style="bold red"))
         return "I'm sorry, there was an error communicating with the AI. Please try again.", False
 
+    # 处理响应
     assistant_response = ""
     exit_continuation = False
     tool_uses = []
 
-    for content_block in response.content:
-        if content_block.type == "text":
-            assistant_response += content_block.text
-            if CONTINUATION_EXIT_PHRASE in content_block.text:
-                exit_continuation = True
-        elif content_block.type == "tool_use":
-            tool_uses.append(content_block)
+    if 'content' in response_data:
+        for content_block in response_data['content']:
+            if content_block['type'] == "text":
+                assistant_response += content_block['text']
+                if CONTINUATION_EXIT_PHRASE in content_block['text']:
+                    exit_continuation = True
+            elif content_block['type'] == "tool_use":
+                tool_uses.append(content_block)
 
-    console.print(Panel(Markdown(assistant_response), title="Claude's Response", title_align="left", expand=False))
+    console.print(Panel(Markdown(assistant_response),
+                  title="Claude's Response", title_align="left", expand=False))
 
     for tool_use in tool_uses:
-        tool_name = tool_use.name
-        tool_input = tool_use.input
-        tool_use_id = tool_use.id
+        tool_name = tool_use['name']
+        tool_input = tool_use['input']
+        tool_use_id = tool_use['id']
 
         console.print(Panel(f"Tool Used: {tool_name}", style="green"))
-        console.print(Panel(f"Tool Input: {json.dumps(tool_input, indent=2)}", style="green"))
+        console.print(
+            Panel(f"Tool Input: {json.dumps(tool_input, indent=2)}", style="green"))
 
         try:
             result = execute_tool(tool_name, tool_input)
-            console.print(Panel(result, title_align="left", title="Tool Result", style="green"))
+            console.print(Panel(result, title_align="left",
+                          title="Tool Result", style="green"))
         except Exception as e:
             result = f"Error executing tool: {str(e)}"
-            console.print(Panel(result, title="Tool Execution Error", style="bold red"))
-        
+            console.print(
+                Panel(result, title="Tool Execution Error", style="bold red"))
+
         current_conversation.append({
             "role": "assistant",
             "content": [
@@ -510,57 +572,76 @@ def chat_with_claude(user_input, image_path=None, current_iteration=None, max_it
 
         messages = conversation_history + current_conversation
 
+        # Send tool result to model
         try:
-            tool_response = client.messages.create(
-                model=TOOLCHECKERMODEL,
-                max_tokens=4000,
-                system=update_system_prompt(current_iteration, max_iterations),
-                messages=messages,
-                tools=tools,
-                tool_choice={"type": "auto"}
-            )
+            tool_request_body = {
+                "anthropic_version": "vertex-2023-10-16",
+                "messages": messages,
+                "max_tokens": 4000,
+                "tools": tools,
+                "tool_choice": {"type": "auto"},
+                "system": update_system_prompt(current_iteration, max_iterations)
+            }
+            tool_api_url = get_api_url(TOOLCHECKERMODEL)
+            tool_response = requests.post(
+                tool_api_url, json=tool_request_body, headers=headers)
+            tool_response.raise_for_status()
+            tool_response_data = tool_response.json()
 
             tool_checker_response = ""
-            for tool_content_block in tool_response.content:
-                if tool_content_block.type == "text":
-                    tool_checker_response += tool_content_block.text
-            console.print(Panel(Markdown(tool_checker_response), title="Claude's Response to Tool Result", title_align="left"))
+            if 'content' in tool_response_data:
+                for tool_content_block in tool_response_data['content']:
+                    if tool_content_block['type'] == "text":
+                        tool_checker_response += tool_content_block['text']
+            console.print(Panel(Markdown(tool_checker_response),
+                          title="Claude's Response to Tool Result", title_align="left"))
             assistant_response += "\n\n" + tool_checker_response
-        except APIError as e:
+        except requests.exceptions.RequestException as e:
             error_message = f"Error in tool response: {str(e)}"
-            console.print(Panel(error_message, title="Error", style="bold red"))
+            console.print(
+                Panel(error_message, title="Error", style="bold red"))
             assistant_response += f"\n\n{error_message}"
 
     if assistant_response:
-        current_conversation.append({"role": "assistant", "content": assistant_response})
+        current_conversation.append(
+            {"role": "assistant", "content": assistant_response})
 
-    conversation_history = messages + [{"role": "assistant", "content": assistant_response}]
+    conversation_history = messages + \
+        [{"role": "assistant", "content": assistant_response}]
 
     return assistant_response, exit_continuation
 
+
 def main():
     global automode, conversation_history
-    console.print(Panel("Welcome to the Claude-3-Sonnet Engineer Chat with Image Support!", title="Welcome", style="bold green"))
+    console.print(Panel("Welcome to the Claude-3-Sonnet Engineer Chat with Image Support!",
+                  title="Welcome", style="bold green"))
     console.print("Type 'exit' to end the conversation.")
     console.print("Type 'image' to include an image in your message.")
-    console.print("Type 'automode [number]' to enter Autonomous mode with a specific number of iterations.")
-    console.print("While in automode, press Ctrl+C at any time to exit the automode to return to regular chat.")
+    console.print(
+        "Type 'automode [number]' to enter Autonomous mode with a specific number of iterations.")
+    console.print(
+        "While in automode, press Ctrl+C at any time to exit the automode to return to regular chat.")
 
     while True:
         user_input = console.input("[bold cyan]You:[/bold cyan] ")
 
         if user_input.lower() == 'exit':
-            console.print(Panel("Thank you for chatting. Goodbye!", title_align="left", title="Goodbye", style="bold green"))
+            console.print(Panel("Thank you for chatting. Goodbye!",
+                          title_align="left", title="Goodbye", style="bold green"))
             break
 
         if user_input.lower() == 'image':
-            image_path = console.input("[bold cyan]Drag and drop your image here, then press enter:[/bold cyan] ").strip().replace("'", "")
+            image_path = console.input(
+                "[bold cyan]Drag and drop your image here, then press enter:[/bold cyan] ").strip().replace("'", "")
 
             if os.path.isfile(image_path):
-                user_input = console.input("[bold cyan]You (prompt for image):[/bold cyan] ")
+                user_input = console.input(
+                    "[bold cyan]You (prompt for image):[/bold cyan] ")
                 response, _ = chat_with_claude(user_input, image_path)
             else:
-                console.print(Panel("Invalid image path. Please try again.", title="Error", style="bold red"))
+                console.print(
+                    Panel("Invalid image path. Please try again.", title="Error", style="bold red"))
                 continue
         elif user_input.lower().startswith('automode'):
             try:
@@ -572,16 +653,19 @@ def main():
 
                 automode = True
                 console.print(Panel(f"Entering automode with {max_iterations} iterations. Please provide the goal of the automode.", title_align="left", title="Automode", style="bold yellow"))
-                console.print(Panel("Press Ctrl+C at any time to exit the automode loop.", style="bold yellow"))
+                console.print(Panel(
+                    "Press Ctrl+C at any time to exit the automode loop.", style="bold yellow"))
                 user_input = console.input("[bold cyan]You:[/bold cyan] ")
 
                 iteration_count = 0
                 try:
                     while automode and iteration_count < max_iterations:
-                        response, exit_continuation = chat_with_claude(user_input, current_iteration=iteration_count+1, max_iterations=max_iterations)
+                        response, exit_continuation = chat_with_claude(
+                            user_input, current_iteration=iteration_count+1, max_iterations=max_iterations)
 
                         if exit_continuation or CONTINUATION_EXIT_PHRASE in response:
-                            console.print(Panel("Automode completed.", title_align="left", title="Automode", style="green"))
+                            console.print(Panel(
+                                "Automode completed.", title_align="left", title="Automode", style="green"))
                             automode = False
                         else:
                             console.print(Panel(f"Continuation iteration {iteration_count + 1} completed. Press Ctrl+C to exit automode. ", title_align="left", title="Automode", style="yellow"))
@@ -589,22 +673,29 @@ def main():
                         iteration_count += 1
 
                         if iteration_count >= max_iterations:
-                            console.print(Panel("Max iterations reached. Exiting automode.", title_align="left", title="Automode", style="bold red"))
+                            console.print(Panel("Max iterations reached. Exiting automode.",
+                                          title_align="left", title="Automode", style="bold red"))
                             automode = False
                 except KeyboardInterrupt:
-                    console.print(Panel("\nAutomode interrupted by user. Exiting automode.", title_align="left", title="Automode", style="bold red"))
+                    console.print(Panel("\nAutomode interrupted by user. Exiting automode.",
+                                  title_align="left", title="Automode", style="bold red"))
                     automode = False
                     if conversation_history and conversation_history[-1]["role"] == "user":
-                        conversation_history.append({"role": "assistant", "content": "Automode interrupted. How can I assist you further?"})
+                        conversation_history.append(
+                            {"role": "assistant", "content": "Automode interrupted. How can I assist you further?"})
             except KeyboardInterrupt:
-                console.print(Panel("\nAutomode interrupted by user. Exiting automode.", title_align="left", title="Automode", style="bold red"))
+                console.print(Panel("\nAutomode interrupted by user. Exiting automode.",
+                              title_align="left", title="Automode", style="bold red"))
                 automode = False
                 if conversation_history and conversation_history[-1]["role"] == "user":
-                    conversation_history.append({"role": "assistant", "content": "Automode interrupted. How can I assist you further?"})
+                    conversation_history.append(
+                        {"role": "assistant", "content": "Automode interrupted. How can I assist you further?"})
 
-            console.print(Panel("Exited automode. Returning to regular chat.", style="green"))
+            console.print(
+                Panel("Exited automode. Returning to regular chat.", style="green"))
         else:
             response, _ = chat_with_claude(user_input)
+
 
 if __name__ == "__main__":
     main()
