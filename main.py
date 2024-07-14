@@ -16,7 +16,34 @@ import requests
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
+import time
+from collections import deque
+from datetime import datetime, timedelta
+
 console = Console()
+
+USE_PROXY = True  # 设置为 False 以禁用代理
+
+if USE_PROXY:
+    PROXY_URL = "http://127.0.0.1:7890"  # 替换为您的代理地址和端口
+    os.environ['HTTP_PROXY'] = PROXY_URL
+    os.environ['HTTPS_PROXY'] = PROXY_URL
+else:
+    # 确保环境变量中没有代理设置
+    os.environ.pop('HTTP_PROXY', None)
+    os.environ.pop('HTTPS_PROXY', None)
+
+# 可用地区列表
+REGIONS = ['us-east5', 'europe-west1']
+
+# 每个地区每分钟的请求限制
+REQUESTS_PER_MINUTE = 5
+
+# 用于跟踪每个地区的请求情况
+region_requests = {region: deque(maxlen=REQUESTS_PER_MINUTE) for region in REGIONS}
+
+# 当前使用的地区索引
+current_region_index = 0
 
 # Add these constants at the top of the file
 CONTINUATION_EXIT_PHRASE = "AUTOMODE_COMPLETE"
@@ -27,10 +54,10 @@ MAINMODEL = "claude-3-5-sonnet@20240620"
 TOOLCHECKERMODEL = "claude-3-5-sonnet@20240620"
 
 # 配置信息
-PROJECT_ID = 'angelic-center-429005-t3'
+PROJECT_ID = 'plasma-figure-429208-r3'
 CLIENT_ID = '764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com'
 CLIENT_SECRET = 'd-FL95Q19q7MQmFpd7hHD0Ty'
-REFRESH_TOKEN = '1//06NsH2-gUPK73CgYIARAAGAYSNwF-L9IrL-OdT_ziOr6W-zlmKqpjyuLUJjK1FObT62OyRkJn-bhloub5TKxcH9C1zRKKNw2kZy4'
+REFRESH_TOKEN = '1//0e12srPo0eeR3CgYIARAAGA4SNwF-L9IrR1SMntQ4NnrobC0hhRZFPpUxtpCpukZIR9Uw0eZLAxOAl_QLXyj5rVtoCb5vxjUtehM'
 
 TOKEN_URL = 'https://www.googleapis.com/oauth2/v4/token'
 
@@ -45,7 +72,58 @@ automode = False
 
 
 # base prompt and automode_system_prompt remain unchanged
+def get_api_url(model):
+    global current_region_index
+    location = REGIONS[current_region_index]
+    return f"https://{location}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{location}/publishers/anthropic/models/{model}:streamRawPredict"
 
+def manage_api_request(model, request_body):
+    global current_region_index
+
+    start_region = current_region_index
+    while True:
+        region = REGIONS[current_region_index]
+        now = datetime.now()
+
+        # 检查当前地区是否有可用配额
+        if len(region_requests[region]) >= REQUESTS_PER_MINUTE:
+            oldest_request = region_requests[region][0]
+            if now - oldest_request < timedelta(minutes=1):
+                console.print(f"Rate limit reached for {region}. Trying next region.")
+                current_region_index = (current_region_index + 1) % len(REGIONS)
+                if current_region_index == start_region:
+                    # 如果所有地区都达到限制，等待一段时间
+                    wait_time = (oldest_request + timedelta(minutes=1) - now).total_seconds()
+                    console.print(f"All regions at capacity. Waiting for {wait_time:.2f} seconds.")
+                    time.sleep(wait_time)
+                continue
+            else:
+                region_requests[region].popleft()
+
+        # 发送请求
+        try:
+            access_token = get_access_token()
+            api_url = get_api_url(model)
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json; charset=utf-8"
+            }
+            console.print(f"Using region: {region}")
+            response = requests.post(api_url, json=request_body, headers=headers)
+            response.raise_for_status()
+            response_data = response.json()
+            
+            region_requests[region].append(now)
+            return response_data
+        except Exception as e:
+            console.print(f"Error in region {region}: {str(e)}")
+            current_region_index = (current_region_index + 1) % len(REGIONS)
+
+        # 如果尝试了所有地区后仍然失败，等待一段时间后重试
+        if current_region_index == start_region:
+            console.print("All regions failed. Waiting before retry.")
+            time.sleep(5)
+        
 def get_access_token():
     creds = Credentials(
         token=None,
@@ -57,11 +135,6 @@ def get_access_token():
 
     creds.refresh(Request())
     return creds.token
-
-
-def get_api_url(model):
-    location = 'us-east5'  # 或者使用您需要的其他位置
-    return f"https://{location}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{location}/publishers/anthropic/models/{model}:streamRawPredict"
 
 
 # base prompt
@@ -500,16 +573,9 @@ def chat_with_claude(user_input, image_path=None, current_iteration=None, max_it
 
     # 发送请求
     try:
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json; charset=utf-8"
-        }
-        response = requests.post(api_url, json=request_body, headers=headers)
-        response.raise_for_status()
-        response_data = response.json()
-    except requests.exceptions.RequestException as e:
-        console.print(
-            Panel(f"API Error: {str(e)}", title="API Error", style="bold red"))
+        response_data = manage_api_request(MAINMODEL, request_body)
+    except Exception as e:
+        console.print(Panel(f"API Error: {str(e)}", title="API Error", style="bold red"))
         return "I'm sorry, there was an error communicating with the AI. Please try again.", False
 
     # 处理响应
@@ -535,17 +601,14 @@ def chat_with_claude(user_input, image_path=None, current_iteration=None, max_it
         tool_use_id = tool_use['id']
 
         console.print(Panel(f"Tool Used: {tool_name}", style="green"))
-        console.print(
-            Panel(f"Tool Input: {json.dumps(tool_input, indent=2)}", style="green"))
+        console.print(Panel(f"Tool Input: {json.dumps(tool_input, indent=2)}", style="green"))
 
         try:
             result = execute_tool(tool_name, tool_input)
-            console.print(Panel(result, title_align="left",
-                          title="Tool Result", style="green"))
+            console.print(Panel(result, title_align="left", title="Tool Result", style="green"))
         except Exception as e:
             result = f"Error executing tool: {str(e)}"
-            console.print(
-                Panel(result, title="Tool Execution Error", style="bold red"))
+            console.print(Panel(result, title="Tool Execution Error", style="bold red"))
 
         current_conversation.append({
             "role": "assistant",
@@ -582,25 +645,20 @@ def chat_with_claude(user_input, image_path=None, current_iteration=None, max_it
                 "tool_choice": {"type": "auto"},
                 "system": update_system_prompt(current_iteration, max_iterations)
             }
-            tool_api_url = get_api_url(TOOLCHECKERMODEL)
-            tool_response = requests.post(
-                tool_api_url, json=tool_request_body, headers=headers)
-            tool_response.raise_for_status()
-            tool_response_data = tool_response.json()
+            tool_response_data = manage_api_request(TOOLCHECKERMODEL, tool_request_body)
 
             tool_checker_response = ""
             if 'content' in tool_response_data:
                 for tool_content_block in tool_response_data['content']:
                     if tool_content_block['type'] == "text":
                         tool_checker_response += tool_content_block['text']
-            console.print(Panel(Markdown(tool_checker_response),
-                          title="Claude's Response to Tool Result", title_align="left"))
+            console.print(Panel(Markdown(tool_checker_response), title="Claude's Response to Tool Result", title_align="left"))
             assistant_response += "\n\n" + tool_checker_response
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             error_message = f"Error in tool response: {str(e)}"
-            console.print(
-                Panel(error_message, title="Error", style="bold red"))
+            console.print(Panel(error_message, title="Error", style="bold red"))
             assistant_response += f"\n\n{error_message}"
+
 
     if assistant_response:
         current_conversation.append(
